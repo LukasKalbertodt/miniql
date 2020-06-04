@@ -5,13 +5,34 @@ use hyper::{
     Body, Method, Response, Server, StatusCode,
 };
 use juniper::{
-    EmptyMutation, RootNode,
+    EmptyMutation, RootNode, FieldResult
 };
-use std::sync::Arc;
+use std::sync::{Mutex, Arc};
+use postgres::{Client, NoTls, Row};
+use fallible_iterator::FallibleIterator;
 
 
 
-struct Context;
+#[derive(juniper::GraphQLObject)]
+struct Series {
+    id: i32,
+    name: String,
+    description: Option<String>,
+}
+
+impl Series {
+    fn from_row(row: Row) -> Self {
+        Self {
+            id: row.get(0),
+            name: row.get(1),
+            description: row.get(2),
+        }
+    }
+}
+
+struct Context {
+    db: Mutex<Client>,
+}
 
 impl juniper::Context for Context {}
 
@@ -24,6 +45,15 @@ impl Query {
     fn apiVersion() -> &str {
         "1.0"
     }
+
+    fn series(context: &Context) -> FieldResult<Vec<Series>> {
+        let result = context.db.lock()?
+            .query_raw("SELECT * FROM series", std::iter::empty())?
+            .map(|row| Ok(Series::from_row(row)))
+            .collect()?;
+
+        Ok(result)
+    }
 }
 
 
@@ -32,9 +62,14 @@ impl Query {
 fn main() {
     pretty_env_logger::init();
 
+    let db = Client::connect("host=localhost dbname=minitest port=5555 user=postgres password=test", NoTls).unwrap();
+
+
     let addr = ([127, 0, 0, 1], 3000).into();
 
-    let ctx = Arc::new(Context);
+    // TODO: this is terrible. We should use a proper connection pool.
+    let db = Mutex::new(db);
+    let ctx = Arc::new(Context { db });
     let root_node = Arc::new(RootNode::new(Query, EmptyMutation::<Context>::new()));
 
     let new_service = move || {
