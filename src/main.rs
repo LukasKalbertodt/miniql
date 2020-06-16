@@ -8,7 +8,7 @@ use juniper::{
     EmptyMutation, LookAheadMethods, RootNode, FieldResult
 };
 use std::sync::{Mutex, Arc};
-use postgres::{Client, NoTls, Row};
+use postgres::{Client, NoTls, Row, Statement};
 use fallible_iterator::FallibleIterator;
 
 
@@ -64,6 +64,7 @@ impl Event {
 
 struct Context {
     db: Mutex<Client>,
+    series_query: Statement,
 }
 
 impl juniper::Context for Context {}
@@ -79,10 +80,12 @@ impl Query {
     }
 
     fn series(context: &Context) -> FieldResult<Vec<Series>> {
+        let before = std::time::Instant::now();
         let result = context.db.lock()?
-            .query_raw("select * from series", std::iter::empty())?
+            .query_raw(&context.series_query, std::iter::empty())?
             .map(|row| Ok(Series::from_row(row)))
             .collect()?;
+        println!("{:?}", before.elapsed());
 
         Ok(result)
     }
@@ -115,14 +118,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pretty_env_logger::init();
 
     let connection_params = "host=localhost dbname=minitest port=5555 user=postgres password=test";
-    let db = Client::connect(connection_params, NoTls)?;
+    let mut db = Client::connect(connection_params, NoTls)?;
 
+    let series_query = db.prepare("select * from series")?;
 
     let addr = ([127, 0, 0, 1], 3000).into();
 
     // TODO: this is terrible. We should use a proper connection pool.
     let db = Mutex::new(db);
-    let ctx = Arc::new(Context { db });
+    let ctx = Arc::new(Context { db, series_query });
     let root_node = Arc::new(RootNode::new(Query, EmptyMutation::<Context>::new()));
 
     let new_service = move || {
