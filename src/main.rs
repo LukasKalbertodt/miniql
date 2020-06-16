@@ -12,6 +12,7 @@ use postgres::{Client, NoTls, Row};
 use fallible_iterator::FallibleIterator;
 
 
+// ===== API definition ======================================================
 
 #[derive(juniper::GraphQLObject)]
 struct Series {
@@ -57,12 +58,14 @@ impl Query {
 }
 
 
+// ===== HTTP Server and init stuf ============================================
 
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     pretty_env_logger::init();
 
-    let db = Client::connect("host=localhost dbname=minitest port=5555 user=postgres password=test", NoTls).unwrap();
+    let connection_params = "host=localhost dbname=minitest port=5555 user=postgres password=test";
+    let db = Client::connect(connection_params, NoTls)?;
 
 
     let addr = ([127, 0, 0, 1], 3000).into();
@@ -98,4 +101,6 @@ fn main() {
     println!("Listening on http://{}", addr);
 
     rt::run(server);
+
+    Ok(())
 }
