@@ -22,12 +22,16 @@ struct Series {
 }
 
 impl Series {
-    fn from_row(row: Row) -> Self {
+    fn from_row_with_offset(row: Row, offset: usize) -> Self {
         Self {
-            id: row.get(0),
-            name: row.get(1),
-            description: row.get(2),
+            id: row.get(offset + 0),
+            name: row.get(offset + 1),
+            description: row.get(offset + 2),
         }
+    }
+
+    fn from_row(row: Row) -> Self {
+        Self::from_row_with_offset(row, 0)
     }
 }
 
@@ -35,7 +39,7 @@ impl Series {
 struct Event {
     id: i32,
     title: String,
-    //part_of integer
+    part_of: Option<Series>,
 }
 
 impl Event {
@@ -43,6 +47,17 @@ impl Event {
         Self {
             id: row.get(0),
             title: row.get(1),
+            part_of: None,
+        }
+    }
+
+    fn from_row_with_series(row: Row) -> Self {
+        Self {
+            id: row.get(0),
+            title: row.get(1),
+            part_of: row.get::<_, Option<i32>>(2).map(
+                |_| Series::from_row_with_offset(row, 2)
+            )
         }
     }
 }
@@ -73,11 +88,22 @@ impl Query {
     }
 
     fn event(context: &Context, executor: &Executor) -> FieldResult<Vec<Event>> {
-        Ok(context.db.lock()?
-            .query_raw("select * from events", std::iter::empty())?
-            .map(|row| Ok(Event::from_row(row)))
-            .collect()?
-        )
+        let result = if executor.look_ahead().child_names().contains(&"partOf") {
+            context.db.lock()?
+                .query_raw(
+                    "select events.id, events.title, series.id, series.name, series.description \
+                     from events left join series on events.part_of = series.id",
+                    std::iter::empty(),
+                )?
+                .map(|row| Ok(Event::from_row_with_series(row)))
+                .collect()?
+        } else {
+            context.db.lock()?
+                .query_raw("select * from events", std::iter::empty())?
+                .map(|row| Ok(Event::from_row(row)))
+                .collect()?
+        };
+        Ok(result)
     }
 }
 
