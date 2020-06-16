@@ -8,7 +8,7 @@ use juniper::{
     EmptyMutation, LookAheadMethods, RootNode, FieldResult
 };
 use std::sync::{Mutex, Arc};
-use postgres::{Client, NoTls, Row, types::FromSql};
+use postgres::{Client, NoTls, Row};
 use fallible_iterator::FallibleIterator;
 
 
@@ -33,29 +33,17 @@ impl Series {
 
 #[derive(juniper::GraphQLObject)]
 struct Event {
-    id: Option<i32>,
-    title: Option<String>,
+    id: i32,
+    title: String,
     //part_of integer
 }
 
 impl Event {
     fn from_row(row: Row) -> Self {
         Self {
-            id: row.get_opt("id"),
-            title: row.get_opt("title"),
+            id: row.get(0),
+            title: row.get(1),
         }
-    }
-}
-
-trait GetOpt {
-    fn get_opt<'a, T: FromSql<'a>>(&'a self, name: &str) -> Option<T>;
-}
-
-impl GetOpt for Row {
-    fn get_opt<'a, T: FromSql<'a>>(&'a self, name: &str) -> Option<T> {
-        self.columns().iter()
-            .position(|column| column.name() == name)
-            .map(|idx| self.get(idx))
     }
 }
 
@@ -86,10 +74,7 @@ impl Query {
 
     fn event(context: &Context, executor: &Executor) -> FieldResult<Vec<Event>> {
         Ok(context.db.lock()?
-            .query_raw(format!(
-                "select {} from events",
-                executor.look_ahead().child_names().join(","),
-            ).as_str(), std::iter::empty())?
+            .query_raw("select * from events", std::iter::empty())?
             .map(|row| Ok(Event::from_row(row)))
             .collect()?
         )
