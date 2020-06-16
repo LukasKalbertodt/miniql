@@ -5,10 +5,10 @@ use hyper::{
     Body, Method, Response, Server, StatusCode,
 };
 use juniper::{
-    EmptyMutation, RootNode, FieldResult
+    EmptyMutation, LookAheadMethods, RootNode, FieldResult
 };
 use std::sync::{Mutex, Arc};
-use postgres::{Client, NoTls, Row};
+use postgres::{Client, NoTls, Row, types::FromSql};
 use fallible_iterator::FallibleIterator;
 
 
@@ -31,6 +31,34 @@ impl Series {
     }
 }
 
+#[derive(juniper::GraphQLObject)]
+struct Event {
+    id: Option<i32>,
+    title: Option<String>,
+    //part_of integer
+}
+
+impl Event {
+    fn from_row(row: Row) -> Self {
+        Self {
+            id: row.get_opt("id"),
+            title: row.get_opt("title"),
+        }
+    }
+}
+
+trait GetOpt {
+    fn get_opt<'a, T: FromSql<'a>>(&'a self, name: &str) -> Option<T>;
+}
+
+impl GetOpt for Row {
+    fn get_opt<'a, T: FromSql<'a>>(&'a self, name: &str) -> Option<T> {
+        self.columns().iter()
+            .position(|column| column.name() == name)
+            .map(|idx| self.get(idx))
+    }
+}
+
 struct Context {
     db: Mutex<Client>,
 }
@@ -49,11 +77,22 @@ impl Query {
 
     fn series(context: &Context) -> FieldResult<Vec<Series>> {
         let result = context.db.lock()?
-            .query_raw("SELECT * FROM series", std::iter::empty())?
+            .query_raw("select * from series", std::iter::empty())?
             .map(|row| Ok(Series::from_row(row)))
             .collect()?;
 
         Ok(result)
+    }
+
+    fn event(context: &Context, executor: &Executor) -> FieldResult<Vec<Event>> {
+        Ok(context.db.lock()?
+            .query_raw(format!(
+                "select {} from events",
+                executor.look_ahead().child_names().join(","),
+            ).as_str(), std::iter::empty())?
+            .map(|row| Ok(Event::from_row(row)))
+            .collect()?
+        )
     }
 }
 
