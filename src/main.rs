@@ -1,15 +1,18 @@
-use futures::future;
+use futures::TryStreamExt;
 use hyper::{
-    rt::{self, Future},
-    service::service_fn,
+    service::{make_service_fn, service_fn},
     Body, Method, Response, Server, StatusCode,
 };
 use juniper::{
-    EmptyMutation, LookAheadMethods, RootNode, FieldResult
+    EmptyMutation, LookAheadMethods, RootNode, FieldResult, EmptySubscription
 };
-use std::sync::{Mutex, Arc};
-use postgres::{Client, NoTls, Row, Statement};
-use fallible_iterator::FallibleIterator;
+use std::{
+    sync::Arc,
+    str::FromStr,
+};
+use tokio_postgres::{Config, NoTls, Row, Statement};
+use mobc::Pool;
+use mobc_postgres::PgConnectionManager;
 
 
 // ===== API definition ======================================================
@@ -63,7 +66,7 @@ impl Event {
 }
 
 struct Context {
-    db: Mutex<Client>,
+    db: Pool<PgConnectionManager<NoTls>>,
     series_query: Statement,
 }
 
@@ -72,39 +75,42 @@ impl juniper::Context for Context {}
 struct Query;
 
 
-#[juniper::object(Context = Context)]
+#[juniper::graphql_object(Context = Context)]
 impl Query {
 
     fn apiVersion() -> &str {
         "1.0"
     }
 
-    fn series(context: &Context) -> FieldResult<Vec<Series>> {
+    async fn series(context: &Context) -> FieldResult<Vec<Series>> {
         let before = std::time::Instant::now();
-        let result = context.db.lock()?
-            .query_raw(&context.series_query, std::iter::empty())?
-            .map(|row| Ok(Series::from_row(row)))
-            .collect()?;
+        let out = context.db.get().await?
+            .query_raw(&context.series_query, std::iter::empty()).await?
+            .map_ok(Series::from_row)
+            .try_collect().await?;
+
+        // pin_mut!(rows);
+        // let out = rows.map_ok(Series::from_row).try_collect().await?;
         println!("{:?}", before.elapsed());
 
-        Ok(result)
+        Ok(out)
     }
 
-    fn event(context: &Context, executor: &Executor) -> FieldResult<Vec<Event>> {
-        let result = if executor.look_ahead().child_names().contains(&"partOf") {
-            context.db.lock()?
+    async fn event(context: &Context, executor: &Executor) -> FieldResult<Vec<Event>> {
+        let result = if executor.look_ahead().children().iter().any(|c| c.field_name() == "partOf") {
+            context.db.get().await?
                 .query_raw(
                     "select events.id, events.title, series.id, series.name, series.description \
                      from events left join series on events.part_of = series.id",
                     std::iter::empty(),
-                )?
-                .map(|row| Ok(Event::from_row_with_series(row)))
-                .collect()?
+                ).await?
+                .map_ok(Event::from_row_with_series)
+                .try_collect().await?
         } else {
-            context.db.lock()?
-                .query_raw("select * from events", std::iter::empty())?
-                .map(|row| Ok(Event::from_row(row)))
-                .collect()?
+            context.db.get().await?
+                .query_raw("select * from events", std::iter::empty()).await?
+                .map_ok(Event::from_row)
+                .try_collect().await?
         };
         Ok(result)
     }
@@ -114,47 +120,60 @@ impl Query {
 // ===== HTTP Server and init stuf ============================================
 
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pretty_env_logger::init();
 
-    let connection_params = "host=localhost dbname=minitest port=5555 user=postgres password=test";
-    let mut db = Client::connect(connection_params, NoTls)?;
+    // let connection_params = "host=localhost dbname=minitest port=5555 user=postgres password=test";
+    // let mut db = Client::connect(connection_params, NoTls)?;
 
-    let series_query = db.prepare("select * from series")?;
+    let config = Config::from_str("postgres://postgres:test@localhost:5555/minitest")?;
+    let manager = PgConnectionManager::new(config, NoTls);
+    let pool = Pool::builder().max_open(20).build(manager);
+
+    let series_query = pool.get().await?.prepare("select * from series").await?;
 
     let addr = ([127, 0, 0, 1], 3000).into();
 
     // TODO: this is terrible. We should use a proper connection pool.
-    let db = Mutex::new(db);
-    let ctx = Arc::new(Context { db, series_query });
-    let root_node = Arc::new(RootNode::new(Query, EmptyMutation::<Context>::new()));
+    let ctx = Arc::new(Context { db: pool, series_query });
+    let root_node = Arc::new(RootNode::new(
+        Query,
+        EmptyMutation::<Context>::new(),
+        EmptySubscription::<Context>::new(),
+    ));
 
-    let new_service = move || {
+    let new_service = make_service_fn(move |_| {
         let root_node = root_node.clone();
         let ctx = ctx.clone();
-        service_fn(move |req| -> Box<dyn Future<Item = _, Error = _> + Send> {
-            let root_node = root_node.clone();
-            let ctx = ctx.clone();
-            match (req.method(), req.uri().path()) {
-                (&Method::GET, "/") => Box::new(juniper_hyper::graphiql("/graphql")),
-                (&Method::GET, "/graphql") => Box::new(juniper_hyper::graphql(root_node, ctx, req)),
-                (&Method::POST, "/graphql") => {
-                    Box::new(juniper_hyper::graphql(root_node, ctx, req))
+
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |req| {
+                let root_node = root_node.clone();
+                let ctx = ctx.clone();
+                async move {
+                    match (req.method(), req.uri().path()) {
+                        (&Method::GET, "/") => juniper_hyper::graphiql("/graphql", None).await,
+                        (&Method::GET, "/graphql") | (&Method::POST, "/graphql") => {
+                            juniper_hyper::graphql(root_node, ctx, req).await
+                        }
+                        _ => {
+                            let mut response = Response::new(Body::empty());
+                            *response.status_mut() = StatusCode::NOT_FOUND;
+                            Ok(response)
+                        }
+                    }
                 }
-                _ => {
-                    let mut response = Response::new(Body::empty());
-                    *response.status_mut() = StatusCode::NOT_FOUND;
-                    Box::new(future::ok(response))
-                }
-            }
-        })
-    };
-    let server = Server::bind(&addr)
-        .serve(new_service)
-        .map_err(|e| eprintln!("server error: {}", e));
+            }))
+        }
+    });
+
+    let server = Server::bind(&addr).serve(new_service);
     println!("Listening on http://{}", addr);
 
-    rt::run(server);
+    if let Err(e) = server.await {
+        eprintln!("server error: {}", e)
+    }
 
     Ok(())
 }

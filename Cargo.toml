@@ -5,10 +5,12 @@ authors = ["Lukas Kalbertodt <lukas.kalbertodt@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-juniper = "0.14"
-juniper_hyper = "0.5.2"
-hyper = "0.12"
+futures = "0.3.1"
+hyper = "0.13"
+juniper = { git = "https://github.com/graphql-rust/juniper.git" }
+juniper_hyper = { git = "https://github.com/graphql-rust/juniper.git" }
+mobc = "0.5"
+mobc-postgres = "0.5"
 pretty_env_logger = "0.4"
-futures = "0.1"
-postgres = "0.17"
-fallible-iterator = "0.2"
+tokio = { version = "0.2", features=["rt-threaded", "macros"] }
+tokio-postgres = "0.5"
