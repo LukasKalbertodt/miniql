@@ -6,13 +6,9 @@ use hyper::{
 use juniper::{
     EmptyMutation, LookAheadMethods, RootNode, FieldResult, EmptySubscription
 };
-use std::{
-    sync::Arc,
-    str::FromStr,
-};
-use tokio_postgres::{Config, NoTls, Row, Statement};
-use mobc::Pool;
-use mobc_postgres::PgConnectionManager;
+use std::sync::Arc;
+use tokio_postgres::{NoTls, Row};
+use deadpool_postgres::{Config, Pool};
 
 
 // ===== API definition ======================================================
@@ -66,8 +62,7 @@ impl Event {
 }
 
 struct Context {
-    db: Pool<PgConnectionManager<NoTls>>,
-    series_query: Statement,
+    db: Pool,
 }
 
 impl juniper::Context for Context {}
@@ -84,10 +79,14 @@ impl Query {
 
     async fn series(context: &Context) -> FieldResult<Vec<Series>> {
         let before = std::time::Instant::now();
-        let out = context.db.get().await?
-            .query_raw(&context.series_query, std::iter::empty()).await?
+
+        let db = context.db.get().await?;
+        let statement = db.prepare("select * from series").await?;
+        let out = db
+            .query_raw(&statement, std::iter::empty()).await?
             .map_ok(Series::from_row)
             .try_collect().await?;
+
 
         // pin_mut!(rows);
         // let out = rows.map_ok(Series::from_row).try_collect().await?;
@@ -124,19 +123,19 @@ impl Query {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pretty_env_logger::init();
 
-    // let connection_params = "host=localhost dbname=minitest port=5555 user=postgres password=test";
-    // let mut db = Client::connect(connection_params, NoTls)?;
-
-    let config = Config::from_str("postgres://postgres:test@localhost:5555/minitest")?;
-    let manager = PgConnectionManager::new(config, NoTls);
-    let pool = Pool::builder().max_open(20).build(manager);
-
-    let series_query = pool.get().await?.prepare("select * from series").await?;
+    let config = Config {
+        user: Some("postgres".into()),
+        password: Some("test".into()),
+        host: Some("localhost".into()),
+        port: Some(5555),
+        dbname: Some("minitest".into()),
+        .. Config::default()
+    };
+    let pool = config.create_pool(NoTls)?;
 
     let addr = ([127, 0, 0, 1], 3000).into();
 
-    // TODO: this is terrible. We should use a proper connection pool.
-    let ctx = Arc::new(Context { db: pool, series_query });
+    let ctx = Arc::new(Context { db: pool   });
     let root_node = Arc::new(RootNode::new(
         Query,
         EmptyMutation::<Context>::new(),
